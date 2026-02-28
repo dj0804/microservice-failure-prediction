@@ -32,6 +32,34 @@ class SimulationService:
     
     def reset_state(self):
         self._initialize_state()
+
+    def initialize_synthetic_graph(self, num_services: int, density: float):
+        import networkx as nx
+        import random
+        G = nx.erdos_renyi_graph(num_services, density, directed=True, seed=random.randint(1, 10000))
+        
+        sim_nodes = []
+        for i in range(num_services):
+            sim_nodes.append(SimServiceNode(
+                id=f"node_{i}",
+                service_name=f"Service-{i}",
+                criticality_score=random.choice([1.0, 1.2, 1.5, 2.0])
+            ))
+            
+        sim_edges = []
+        for source, target in G.edges():
+            sim_edges.append(SimDependencyEdge(
+                source_node_id=f"node_{source}",
+                target_node_id=f"node_{target}",
+                amplification_factor=round(random.uniform(0.5, 1.5), 2)
+            ))
+            
+        self.graph_engine.build_from_definitions(sim_nodes, sim_edges)
+        self.current_tick = 0
+        self.last_risks = {}
+        self.last_intelligence = {}
+        self.logger = CounterfactualLogger()
+        return {"status": "Graph initialized synthetically", "nodes": len(sim_nodes), "edges": len(sim_edges)}
         
     def initialize_graph(self, nodes_data: List[Dict], edges_data: List[Dict]):
         """
@@ -156,4 +184,21 @@ class SimulationService:
         return self.logger.evaluate()
         
     def get_graph_state(self):
-        return self.last_risks
+        nodes = []
+        for n in self.graph_engine.get_all_nodes():
+            nodes.append({
+                "id": n.id,
+                "name": n.service_name,
+                "calculated_risk_score": self.last_risks.get(n.id, 0.0),
+                "criticality_score": n.criticality_score
+            })
+            
+        edges = []
+        for e in self.graph_engine.get_all_edges():
+            edges.append({
+                "source": e.source_node_id,
+                "target": e.target_node_id,
+                "amplification_factor": e.amplification_factor
+            })
+            
+        return {"nodes": nodes, "edges": edges}

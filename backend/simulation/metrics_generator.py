@@ -26,13 +26,15 @@ class MetricsGenerator:
         
         # 1. Generate Baseline Metrics
         for node in nodes:
-            # Healthy baseline
+            # Healthy baseline with random noise bumps to induce false-positives
+            noise = random.uniform(0, 0.5) if random.random() < 0.1 else 0
+            
             metrics[node.id] = MetricTick(
                 tick_id=tick_id,
                 node_id=node.id,
-                cpu_utilization=random.uniform(0.1, 0.4),
-                latency_ms=random.uniform(10.0, 50.0),
-                error_rate=random.uniform(0.001, 0.01)
+                cpu_utilization=min(1.0, random.uniform(0.1, 0.4) + noise),
+                latency_ms=random.uniform(10.0, 50.0) + (noise * 100),
+                error_rate=min(1.0, random.uniform(0.001, 0.01) + (noise / 10))
             )
 
         # 2. Apply active faults
