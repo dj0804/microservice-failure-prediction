@@ -1,8 +1,0 @@
-networkx
-pandas
-pytest
-pydantic
-Django>=5.0
-djangorestframework
-psycopg2-binary
-django-cors-headers
