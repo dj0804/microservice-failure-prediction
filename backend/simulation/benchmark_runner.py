@@ -6,17 +6,18 @@ from typing import Dict, Any, List
 from simulation.models import ServiceNode, DependencyEdge, MetricTick
 from simulation.graph_engine import GraphEngine
 from simulation.metrics_generator import MetricsGenerator, FaultEvent
-from simulation.propagation import RiskPropagationEngine
-from simulation.risk_aggregation import CascadeSeverityScorer
+from simulation.graph_learning_model import GraphFailurePredictor
 from simulation.action_engine import PreventiveActionEngine
 from simulation.counterfactual_logger import CounterfactualLogger
-from simulation.feedback_learning import DeterministicFeedbackLoop
 
 class BenchmarkRunner:
     """
     Executes structured experimental trials and produces quantitative resilience metrics
-    suitable for research validation. Evaluates the difference between baseline, 
-    action mitigations, and adaptive feedback learning loops.
+    suitable for research validation. Evaluates the difference between baseline,
+    action mitigations, and adaptive graph-learning predictions.
+
+    Uses GraphFailurePredictor (Graph Learning Agent) instead of the legacy
+    deterministic RiskPropagationEngine + DeterministicFeedbackLoop.
     """
     def __init__(self, config: Dict[str, Any]):
         self.num_services = config.get("num_services", 10)
@@ -50,14 +51,18 @@ class BenchmarkRunner:
 
     def run_benchmark(self) -> Dict[str, Any]:
         """
-        Runs the benchmark comparing the 3 modes.
+        Runs the benchmark comparing 3 modes:
+        1. No mitigation (baseline)
+        2. Static mitigation (action engine with cold-start predictor)
+        3. Adaptive learning (predictor improves over cycles)
         """
         results_no_mitigation = []
         results_with_mitigation = []
         results_with_learning = []
 
         for trial in range(self.repeated_trials):
-            feedback_loop = DeterministicFeedbackLoop()
+            # Shared predictor that learns across cycles
+            learning_predictor = GraphFailurePredictor()
             
             for cycle in range(self.learning_cycles):
                 seed = trial * 1000 + cycle
@@ -66,14 +71,15 @@ class BenchmarkRunner:
                 random.seed(seed)
                 target_node = f"node_{random.randint(0, self.num_services - 1)}"
                 
-                # 1. No Mitigation & 2. Static Mitigation (we can extract this directly from the Action Engine eval)
-                static_res = self._run_single_scenario(seed, target_node, use_learning=False, feedback_loop=None)
+                # 1. No Mitigation & 2. Static Mitigation (fresh predictor each time)
+                static_predictor = GraphFailurePredictor()
+                static_res = self._run_single_scenario(seed, target_node, static_predictor, train_model=False)
                 if static_res:
                     results_no_mitigation.append(static_res["baseline"])
                     results_with_mitigation.append(static_res["mitigated"])
                 
-                # 3. With Learning
-                adaptive_res = self._run_single_scenario(seed, target_node, use_learning=True, feedback_loop=feedback_loop)
+                # 3. With Learning (shared predictor improves over cycles)
+                adaptive_res = self._run_single_scenario(seed, target_node, learning_predictor, train_model=True)
                 if adaptive_res:
                     results_with_learning.append(adaptive_res["mitigated"])
 
@@ -84,26 +90,11 @@ class BenchmarkRunner:
             "adaptive_learning_metrics": self._aggregate(results_with_learning, compute_trend=True, cycles=self.learning_cycles)
         }
 
-    def _run_single_scenario(self, seed: int, target_node: str, use_learning: bool, feedback_loop: DeterministicFeedbackLoop) -> Dict[str, Any]:
+    def _run_single_scenario(self, seed: int, target_node: str, predictor: GraphFailurePredictor, train_model: bool) -> Dict[str, Any]:
         graph = self._generate_synthetic_graph(seed)
         
-        # Determine params
-        if use_learning and feedback_loop:
-            params = feedback_loop.get_current_parameters()
-        else:
-            params = {
-                "high_risk_threshold": 0.5,
-                "amplification_multiplier": 1.0,
-                "hop_decay": 0.8
-            }
-            
-        risk_engine = RiskPropagationEngine(
-            hop_decay_factor=params["hop_decay"],
-            amplification_multiplier=params["amplification_multiplier"]
-        )
-        scorer = CascadeSeverityScorer(high_risk_threshold=params["high_risk_threshold"])
-        action_engine = PreventiveActionEngine(risk_engine, scorer)
-        logger = CounterfactualLogger(high_risk_threshold=params["high_risk_threshold"])
+        action_engine = PreventiveActionEngine(predictor)
+        logger = CounterfactualLogger(high_risk_threshold=predictor.high_risk_threshold)
         metrics_gen = MetricsGenerator()
         
         metrics_gen.inject_fault(FaultEvent(
@@ -115,6 +106,8 @@ class BenchmarkRunner:
         
         tick = 0
         action_result = None
+        last_risks = {}
+        last_intel = {}
         
         while tick < 15:
             tick += 1
@@ -125,8 +118,18 @@ class BenchmarkRunner:
                     n.current_metrics = metrics[n.id]
                     graph.update_node(n)
                     
-            risks = risk_engine.propagate_risk(graph)
-            intel = scorer.aggregate(risks, graph)
+            # Use GraphFailurePredictor instead of old risk propagation
+            prediction_result = predictor.predict_failure_probabilities(graph)
+            risks = prediction_result["node_failure_probabilities"]
+            intel = {
+                "system_risk_score": prediction_result["system_risk_score"],
+                "high_risk_node_count": prediction_result["high_risk_node_count"],
+                "predicted_cascade_size": prediction_result["predicted_cascade_size"],
+                "severity_level": prediction_result["severity_level"],
+                "high_risk_nodes": prediction_result["high_risk_nodes"],
+            }
+            last_risks = risks
+            last_intel = intel
             
             if not logger.is_tracking:
                 if intel.get("severity_level") != "LOW":
@@ -140,9 +143,15 @@ class BenchmarkRunner:
         eval_report = logger.evaluate()
         if "error" in eval_report:
             return None
-            
-        if use_learning and feedback_loop:
-            feedback_loop.update_parameters(eval_report)
+        
+        # Train the predictor if in learning mode
+        if train_model:
+            actual_failed = logger.actual_failed_nodes
+            actual_labels = {}
+            for node in graph.get_all_nodes():
+                actual_labels[node.id] = node.id in actual_failed
+            predictor.train_on_batch(last_risks, actual_labels, graph)
+            predictor.update_model()
             
         # The true "baseline" outcome is what the logger actually observed.
         base_cascade = eval_report["actual"]["actual_cascade_size"]

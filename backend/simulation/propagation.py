@@ -1,3 +1,23 @@
+"""
+===============================================================================
+DEPRECATED — This module is superseded by graph_learning_model.py
+
+The RiskPropagationEngine (BFS + hop decay) has been replaced by the
+GraphFailurePredictor (Graph Learning Agent), which learns failure
+propagation implicitly via graph-aware embeddings rather than explicit
+BFS traversal.
+
+This module is retained for backward compatibility and testing of the
+legacy deterministic system.
+===============================================================================
+"""
+import warnings
+warnings.warn(
+    "simulation.propagation is deprecated. Use simulation.graph_learning_model.GraphFailurePredictor instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from typing import Dict
 from .graph_engine import GraphEngine
 from .models import ServiceNode

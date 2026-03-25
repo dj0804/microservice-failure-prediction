@@ -5,3 +5,6 @@ networkx>=3.3
 pydantic>=2.8
 psycopg2-binary>=2.9
 pytest>=8.0
+numpy>=1.26
+scikit-learn>=1.5
+joblib>=1.4

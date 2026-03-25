@@ -1,3 +1,22 @@
+"""
+===============================================================================
+DEPRECATED — This module is superseded by graph_learning_model.py
+
+The DeterministicFeedbackLoop (rule-based parameter tuning of amplification,
+hop_decay, and threshold) has been replaced by model weight updates via
+GraphFailurePredictor.train_on_batch() and GraphFailurePredictor.update_model().
+
+This module is retained for backward compatibility and testing of the
+legacy deterministic system.
+===============================================================================
+"""
+import warnings
+warnings.warn(
+    "simulation.feedback_learning is deprecated. Use simulation.graph_learning_model.GraphFailurePredictor instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
+
 from typing import Dict, Any, List
 import copy
 

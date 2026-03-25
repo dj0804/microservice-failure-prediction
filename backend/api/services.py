@@ -2,8 +2,7 @@ from typing import List, Dict, Any
 from simulation.graph_engine import GraphEngine
 from simulation.models import ServiceNode as SimServiceNode, DependencyEdge as SimDependencyEdge
 from simulation.metrics_generator import MetricsGenerator, FaultEvent
-from simulation.propagation import RiskPropagationEngine
-from simulation.risk_aggregation import CascadeSeverityScorer
+from simulation.graph_learning_model import GraphFailurePredictor
 from simulation.counterfactual_logger import CounterfactualLogger
 from .models import ServiceNode, DependencyEdge, SimulationRun, EvaluationReport
 
@@ -11,6 +10,10 @@ class SimulationService:
     """
     Singleton orchestration layer for the pure Python simulation components.
     Ensures that Django views never touch NetworkX or internal math logic directly.
+
+    Uses the GraphFailurePredictor (Graph Learning Agent) for probabilistic
+    failure prediction, replacing the legacy deterministic RiskPropagationEngine
+    and CascadeSeverityScorer.
     """
     _instance = None
     
@@ -23,8 +26,7 @@ class SimulationService:
     def _initialize_state(self):
         self.graph_engine = GraphEngine()
         self.metrics_generator = MetricsGenerator()
-        self.risk_engine = RiskPropagationEngine()
-        self.scorer = CascadeSeverityScorer()
+        self.predictor = GraphFailurePredictor()
         self.logger = CounterfactualLogger()
         self.current_tick = 0
         self.last_intelligence = {}
@@ -113,6 +115,9 @@ class SimulationService:
     def run_simulation(self):
         """
         Advances the simulation clock safely orchestrating all components.
+
+        Uses GraphFailurePredictor (Graph Learning Agent) for probabilistic
+        failure prediction instead of the legacy deterministic propagation.
         """
         self.current_tick += 1
         nodes = self.graph_engine.get_all_nodes()
@@ -126,41 +131,80 @@ class SimulationService:
                 node.current_metrics = metrics[node.id]
                 self.graph_engine.update_node(node)
                 
-        # 3. Propagate Risk
-        self.last_risks = self.risk_engine.propagate_risk(self.graph_engine)
+        # 3. Predict failure probabilities (replaces propagate_risk + aggregate)
+        prediction_result = self.predictor.predict_failure_probabilities(self.graph_engine)
         
-        # 4. Score Severity
-        self.last_intelligence = self.scorer.aggregate(self.last_risks, self.graph_engine)
+        # Extract backward-compatible fields
+        self.last_risks = prediction_result["node_failure_probabilities"]
+        self.last_intelligence = {
+            "system_risk_score": prediction_result["system_risk_score"],
+            "high_risk_node_count": prediction_result["high_risk_node_count"],
+            "predicted_cascade_size": prediction_result["predicted_cascade_size"],
+            "severity_level": prediction_result["severity_level"],
+            "prediction_mode": prediction_result["prediction_mode"],
+            "high_risk_nodes": prediction_result["high_risk_nodes"],
+        }
         
-        # 5. Handle Logging
+        # 4. Handle Logging & Training Integration
         if not self.logger.is_tracking:
-            # We assume a fault was just injected if risk is high but we aren't tracking
+            # Start tracking if severity is non-trivial
             if self.last_intelligence.get("severity_level") != "LOW":
                 self.logger.snapshot_prediction(self.current_tick, self.last_intelligence, self.last_risks)
         else:
             self.logger.track_actual_tick(self.current_tick, self.last_intelligence, self.last_risks)
             
-            # If tracking just finished, persist the evaluation run to Postgres
+            # If tracking just finished, train the model and persist evaluation
             if not self.logger.is_tracking:
-                self._persist_evaluation_run()
+                self._train_and_persist()
                 
         return {
             "tick": self.current_tick,
             "intelligence": self.last_intelligence,
             "risks": self.last_risks
         }
+
+    def _train_and_persist(self):
+        """
+        After the CounterfactualLogger finishes tracking an event:
+        1. Extract predicted vs actual failure labels
+        2. Feed to predictor.train_on_batch()
+        3. Retrain model via predictor.update_model()
+        4. Persist evaluation to Postgres
+        """
+        eval_data = self.logger.evaluate()
+        if "error" in eval_data:
+            return
         
-    def _persist_evaluation_run(self):
+        # Build actual failure labels from logger
+        actual_failed_nodes = self.logger.actual_failed_nodes
+        predicted_probs = {}
+        actual_labels = {}
+        
+        for node in self.graph_engine.get_all_nodes():
+            predicted_probs[node.id] = self.last_risks.get(node.id, 0.0)
+            actual_labels[node.id] = node.id in actual_failed_nodes
+        
+        # Train the Graph Learning Agent
+        batch_result = self.predictor.train_on_batch(
+            predicted_probs, actual_labels, self.graph_engine
+        )
+        if batch_result["ready_to_train"]:
+            self.predictor.update_model()
+        
+        # Persist evaluation to DB
+        self._persist_evaluation_run(eval_data)
+
+    def _persist_evaluation_run(self, eval_data: Dict = None):
         """
         Takes the counterfactual logger results and saves them to the DB.
         """
-        eval_data = self.logger.evaluate()
+        if eval_data is None:
+            eval_data = self.logger.evaluate()
         if "error" in eval_data:
             return
             
         metrics = eval_data.get("evaluation", {})
         
-        # We don't have the explicit target node in the logger, but we can assign none for now or look at highest risk
         run_obj = SimulationRun.objects.create(
             fault_type="synthetic_cascade", 
             final_severity=metrics.get("actual_inferred_severity", "LOW"),

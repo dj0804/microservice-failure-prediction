@@ -1,19 +1,20 @@
 from typing import Dict, Any, List
 import copy
 from .graph_engine import GraphEngine
-from .propagation import RiskPropagationEngine
-from .risk_aggregation import CascadeSeverityScorer
+from .graph_learning_model import GraphFailurePredictor
 
 class PreventiveActionEngine:
     """
     Evaluates predicted cascades and applies hypothetical graph modifications
     (ISOLATE, THROTTLE) to a temporary topological copy, measuring the hypothetical
     risk reduction before returning an optimal mitigation strategy.
+
+    Uses GraphFailurePredictor (Graph Learning Agent) for probabilistic evaluation
+    instead of the legacy deterministic RiskPropagationEngine + CascadeSeverityScorer.
     """
     
-    def __init__(self, risk_engine: RiskPropagationEngine, scorer: CascadeSeverityScorer):
-        self.risk_engine = risk_engine
-        self.scorer = scorer
+    def __init__(self, predictor: GraphFailurePredictor):
+        self.predictor = predictor
 
     def _clone_graph(self, graph: GraphEngine) -> GraphEngine:
         """
@@ -68,7 +69,7 @@ class PreventiveActionEngine:
                             action_type: str, 
                             target_nodes: List[str]) -> Dict[str, Any]:
         """
-        Runs the full mitigation evaluation cycle.
+        Runs the full mitigation evaluation cycle using the Graph Learning Agent.
         """
         baseline_cascade_size = baseline_intelligence.get("predicted_cascade_size", 0)
         baseline_severity = baseline_intelligence.get("severity_level", "LOW")
@@ -77,18 +78,14 @@ class PreventiveActionEngine:
         # 1. Apply action to temporary graph
         temp_graph = self.apply_action(original_graph, action_type, target_nodes)
         
-        # 2. Re-run propagation on temp graph
-        # Note: Base metrics (CPU, Latency) are already trapped inside the node states. 
-        # We just re-diffuse based on the new edges.
-        new_risks = self.risk_engine.propagate_risk(temp_graph)
+        # 2. Predict failure probabilities on modified graph
+        new_result = self.predictor.predict_failure_probabilities(temp_graph)
         
-        # 3. Score severity on temp graph
-        new_intelligence = self.scorer.aggregate(new_risks, temp_graph)
-        new_cascade_size = new_intelligence.get("predicted_cascade_size", 0)
-        new_severity = new_intelligence.get("severity_level", "LOW")
-        new_sys_risk = new_intelligence.get("system_risk_score", 0.0)
+        new_cascade_size = new_result.get("predicted_cascade_size", 0)
+        new_severity = new_result.get("severity_level", "LOW")
+        new_sys_risk = new_result.get("system_risk_score", 0.0)
 
-        # 4. Measure
+        # 3. Measure risk reduction
         risk_reduction_percent = 0.0
         if baseline_sys_risk > 0:
             risk_reduction_percent = ((baseline_sys_risk - new_sys_risk) / baseline_sys_risk) * 100.0
@@ -115,8 +112,12 @@ class PreventiveActionEngine:
                 "reason": "Severity below threshold"
             }
             
-        # Get raw high risk nodes
-        high_risk_nodes = [nid for nid, risk in risks.items() if risk >= self.scorer.high_risk_threshold]
+        # Get high-risk nodes from the intelligence output
+        high_risk_nodes = intelligence.get("high_risk_nodes", [])
+        
+        # Fallback: derive from raw probabilities if not in intelligence
+        if not high_risk_nodes:
+            high_risk_nodes = [nid for nid, prob in risks.items() if prob >= self.predictor.high_risk_threshold]
         
         if not high_risk_nodes:
              return {"action_taken": "NONE", "reason": "No discrete high risk nodes identified"}
