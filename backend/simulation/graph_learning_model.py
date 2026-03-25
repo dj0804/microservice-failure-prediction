@@ -30,6 +30,7 @@ import warnings
 from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
+import networkx as nx
 
 from .graph_engine import GraphEngine
 from .models import ServiceNode
@@ -45,6 +46,7 @@ _TEMPORAL_DIM = 2         # delta_cpu, previous_cpu
 _TOTAL_INPUT_DIM = _EMBEDDING_DIM + _TEMPORAL_DIM  # 14
 _MIN_SAMPLES_FOR_TRAINING = 10
 _HIGH_RISK_THRESHOLD = 0.7
+_CASCADE_TOP_K_PATHS = 3
 
 
 class GraphFailurePredictor:
@@ -107,6 +109,11 @@ class GraphFailurePredictor:
                 "node_failure_probabilities": Dict[node_id, float],
                 "system_risk_score": float,
                 "high_risk_nodes": List[str],
+                "predicted_affected_nodes": List[str],
+                "cascade_size": int,
+                "propagation_paths": List[List[str]],
+                "propagation_risk_score": float,
+                "system_failure_probability": float,
                 "severity_level": str,
                 "prediction_mode": "learned" | "cold_start"
             }
@@ -117,6 +124,13 @@ class GraphFailurePredictor:
                 "node_failure_probabilities": {},
                 "system_risk_score": 0.0,
                 "high_risk_nodes": [],
+                "predicted_affected_nodes": [],
+                "cascade_size": 0,
+                "propagation_paths": [],
+                "propagation_risk_score": 0.0,
+                "system_failure_probability": 0.0,
+                "high_risk_node_count": 0,
+                "predicted_cascade_size": 0,
                 "severity_level": "LOW",
                 "prediction_mode": "cold_start",
             }
@@ -563,6 +577,109 @@ class GraphFailurePredictor:
     # INTERNAL: OUTPUT ASSEMBLY
     # ======================================================================
 
+    def predict_cascade(
+        self, graph_engine: GraphEngine, node_probabilities: Dict[str, float]
+    ) -> Dict[str, Any]:
+        """
+        Derives cascade insights from predicted node failure probabilities.
+
+        This method is intentionally lightweight and deterministic. It uses
+        probability thresholds plus graph topology only — no BFS-based
+        propagation decay and no deterministic simulation loops.
+        """
+        node_ids = [node.id for node in graph_engine.get_all_nodes()]
+        total_nodes = len(node_ids)
+        if total_nodes == 0:
+            return {
+                "predicted_affected_nodes": [],
+                "cascade_size": 0,
+                "propagation_paths": [],
+                "propagation_risk_score": 0.0,
+                "system_failure_probability": 0.0,
+            }
+
+        threshold = self.high_risk_threshold
+
+        affected_nodes = sorted(
+            [
+                node_id
+                for node_id in node_ids
+                if node_probabilities.get(node_id, 0.0) >= threshold
+            ],
+            key=lambda node_id: (-node_probabilities.get(node_id, 0.0), node_id),
+        )
+        affected_set = set(affected_nodes)
+
+        candidate_paths: List[List[str]] = []
+        for node_id in affected_nodes:
+            direct_dependents = [
+                dep
+                for dep in graph_engine.get_upstream_dependents(node_id)
+                if dep in affected_set
+            ]
+            for dependent_id in sorted(
+                direct_dependents,
+                key=lambda dep: (-node_probabilities.get(dep, 0.0), dep),
+            ):
+                path = [node_id, dependent_id]
+                visited = {node_id, dependent_id}
+                current = dependent_id
+
+                while True:
+                    next_candidates = [
+                        dep
+                        for dep in graph_engine.get_upstream_dependents(current)
+                        if dep in affected_set and dep not in visited
+                    ]
+                    if not next_candidates:
+                        break
+
+                    next_node = sorted(
+                        next_candidates,
+                        key=lambda dep: (-node_probabilities.get(dep, 0.0), dep),
+                    )[0]
+                    path.append(next_node)
+                    visited.add(next_node)
+                    current = next_node
+
+                candidate_paths.append(path)
+
+        unique_paths: List[List[str]] = []
+        seen = set()
+        for path in candidate_paths:
+            key = tuple(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(path)
+
+        unique_paths.sort(
+            key=lambda path: (
+                -sum(node_probabilities.get(node_id, 0.0) for node_id in path),
+                -len(path),
+                path,
+            )
+        )
+        propagation_paths = unique_paths[:_CASCADE_TOP_K_PATHS]
+
+        propagation_risk_numerator = 0.0
+        for node_id in node_ids:
+            if not graph_engine.graph.has_node(node_id):
+                continue
+            reachable_nodes = nx.descendants(graph_engine.graph.reverse(copy=False), node_id)
+            propagation_risk_numerator += node_probabilities.get(node_id, 0.0) * len(reachable_nodes)
+
+        propagation_risk_score = propagation_risk_numerator / total_nodes
+        system_failure_probability = len(affected_nodes) / total_nodes
+
+        return {
+            "predicted_affected_nodes": affected_nodes,
+            "cascade_size": len(affected_nodes),
+            "propagation_paths": propagation_paths,
+            "propagation_risk_score": round(propagation_risk_score, 4),
+            "system_failure_probability": round(system_failure_probability, 4),
+        }
+
     def _build_output(
         self,
         nodes: List[ServiceNode],
@@ -598,8 +715,8 @@ class GraphFailurePredictor:
         ]
         high_risk_count = len(high_risk_nodes)
 
-        # Cascade size estimate: count of nodes with P(failure) > 0.3
-        cascade_size = sum(1 for p in probabilities.values() if p > 0.3)
+        cascade_result = self.predict_cascade(graph_engine, probabilities)
+        cascade_size = cascade_result["cascade_size"]
 
         # Severity classification (backward-compatible thresholds)
         severity = self._classify_severity(
@@ -610,6 +727,11 @@ class GraphFailurePredictor:
             "node_failure_probabilities": probabilities,
             "system_risk_score": round(system_risk, 4),
             "high_risk_nodes": high_risk_nodes,
+            "predicted_affected_nodes": cascade_result["predicted_affected_nodes"],
+            "cascade_size": cascade_result["cascade_size"],
+            "propagation_paths": cascade_result["propagation_paths"],
+            "propagation_risk_score": cascade_result["propagation_risk_score"],
+            "system_failure_probability": cascade_result["system_failure_probability"],
             "high_risk_node_count": high_risk_count,
             "predicted_cascade_size": cascade_size,
             "severity_level": severity,

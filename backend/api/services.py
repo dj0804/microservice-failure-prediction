@@ -133,6 +133,10 @@ class SimulationService:
                 
         # 3. Predict failure probabilities (replaces propagate_risk + aggregate)
         prediction_result = self.predictor.predict_failure_probabilities(self.graph_engine)
+        cascade_result = self.predictor.predict_cascade(
+            self.graph_engine,
+            prediction_result["node_failure_probabilities"],
+        )
         
         # Extract backward-compatible fields
         self.last_risks = prediction_result["node_failure_probabilities"]
@@ -143,6 +147,11 @@ class SimulationService:
             "severity_level": prediction_result["severity_level"],
             "prediction_mode": prediction_result["prediction_mode"],
             "high_risk_nodes": prediction_result["high_risk_nodes"],
+            "predicted_affected_nodes": cascade_result["predicted_affected_nodes"],
+            "cascade_size": cascade_result["cascade_size"],
+            "propagation_paths": cascade_result["propagation_paths"],
+            "propagation_risk_score": cascade_result["propagation_risk_score"],
+            "system_failure_probability": cascade_result["system_failure_probability"],
         }
         
         # 4. Handle Logging & Training Integration

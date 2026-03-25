@@ -216,6 +216,11 @@ class TestOutputFormat:
         assert "prediction_mode" in result
         assert "high_risk_node_count" in result
         assert "predicted_cascade_size" in result
+        assert "predicted_affected_nodes" in result
+        assert "cascade_size" in result
+        assert "propagation_paths" in result
+        assert "propagation_risk_score" in result
+        assert "system_failure_probability" in result
 
     def test_severity_classification(self, predictor, linear_graph):
         # Force a critical scenario
@@ -225,6 +230,29 @@ class TestOutputFormat:
         result = predictor.predict_failure_probabilities(linear_graph)
 
         assert result["severity_level"] in ["HIGH", "CRITICAL"]
+
+
+class TestCascadePrediction:
+    def test_predict_cascade_outputs(self, predictor, linear_graph):
+        probabilities = {"web": 0.92, "api": 0.88, "db": 0.91}
+
+        cascade = predictor.predict_cascade(linear_graph, probabilities)
+
+        assert set(cascade["predicted_affected_nodes"]) == {"web", "api", "db"}
+        assert cascade["cascade_size"] == 3
+        assert isinstance(cascade["propagation_paths"], list)
+        assert len(cascade["propagation_paths"]) <= 3
+        assert 0.0 <= cascade["system_failure_probability"] <= 1.0
+        assert cascade["system_failure_probability"] == pytest.approx(1.0)
+        assert cascade["propagation_risk_score"] >= 0.0
+
+    def test_predict_cascade_threshold_respected(self, predictor, linear_graph):
+        probabilities = {"web": 0.3, "api": 0.75, "db": 0.2}
+
+        cascade = predictor.predict_cascade(linear_graph, probabilities)
+
+        assert cascade["predicted_affected_nodes"] == ["api"]
+        assert cascade["cascade_size"] == 1
 
 
 # =========================================================================
