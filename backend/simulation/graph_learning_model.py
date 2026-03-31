@@ -87,6 +87,9 @@ class GraphFailurePredictor:
         # -- Temporal state: tracks previous tick's CPU per node --
         self._prev_cpu: Dict[str, float] = {}
 
+        # -- Metric History for Dynamic Attention (rolling window of last 10 ticks) --
+        self._metric_history: Dict[str, Dict[str, List[float]]] = {}
+
         # -- Training iteration counter --
         self._training_iteration: int = 0
 
@@ -302,6 +305,7 @@ class GraphFailurePredictor:
             "X_buffer": self._X_buffer,
             "y_buffer": self._y_buffer,
             "prev_cpu": self._prev_cpu,
+            "metric_history": self._metric_history,
             "training_iteration": self._training_iteration,
             "high_risk_threshold": self.high_risk_threshold,
         }
@@ -332,6 +336,7 @@ class GraphFailurePredictor:
             self._X_buffer = state["X_buffer"]
             self._y_buffer = state["y_buffer"]
             self._prev_cpu = state["prev_cpu"]
+            self._metric_history = state.get("metric_history", {})
             self._training_iteration = state["training_iteration"]
             self.high_risk_threshold = state["high_risk_threshold"]
             logger.info(
@@ -386,6 +391,35 @@ class GraphFailurePredictor:
 
         return features
 
+    def _calculate_dynamic_attention(self, node_a: str, node_b: str, base_weight: float) -> float:
+        """
+        Calculates a dynamic attention score (edge weight multiplier) between two nodes
+        based on the real-time Pearson Correlation of their last 10 telemetry ticks.
+        """
+        hist_a = self._metric_history.get(node_a)
+        hist_b = self._metric_history.get(node_b)
+        
+        # If we don't have enough history yet, return static amplification factor
+        if not hist_a or not hist_b or len(hist_a["cpu"]) < 5:
+            return base_weight
+            
+        # Correlate CPU vectors
+        cpu_a, cpu_b = hist_a["cpu"], hist_b["cpu"]
+        
+        # Handle zero variance perfectly flat arrays which would crash np.corrcoef with NaN
+        std_a = np.std(cpu_a)
+        std_b = np.std(cpu_b)
+        
+        correlation = 0.0
+        if std_a > 1e-6 and std_b > 1e-6:
+            r = np.corrcoef(cpu_a, cpu_b)[0, 1]
+            if not np.isnan(r):
+                correlation = float(r)
+                
+        # Dynamic Multiplier: Base * (1 + max(0, correlation))
+        # Meaning: High positive sync = up to doubled attention. Uncorrelated = Base weight.
+        return float(base_weight * (1.0 + max(0.0, correlation)))
+
     def _compute_graph_embeddings(
         self,
         nodes: List[ServiceNode],
@@ -416,8 +450,12 @@ class GraphFailurePredictor:
                 for nb_id in neighbors:
                     if nb_id in raw_features:
                         w = edge_weights.get((node.id, nb_id), 1.0)
-                        weighted_feats.append(raw_features[nb_id] * w)
-                        total_weight += w
+                        
+                        # Apply dynamic attention instead of purely static amplification
+                        dynamic_w = self._calculate_dynamic_attention(node.id, nb_id, w)
+                        
+                        weighted_feats.append(raw_features[nb_id] * dynamic_w)
+                        total_weight += dynamic_w
 
                 if total_weight > 0:
                     neighbor_agg = np.sum(weighted_feats, axis=0) / total_weight
@@ -459,10 +497,23 @@ class GraphFailurePredictor:
         return np.hstack([embeddings, temporal_arr])
 
     def _update_temporal_state(self, nodes: List[ServiceNode]) -> None:
-        """Updates the previous-tick CPU cache for temporal signal computation."""
+        """Updates the temporal state and metric history (10-tick rolling window) for dynamic attention."""
         for node in nodes:
             if node.current_metrics:
                 self._prev_cpu[node.id] = node.current_metrics.cpu_utilization
+                
+                if node.id not in self._metric_history:
+                    self._metric_history[node.id] = {"cpu": [], "latency": []}
+                
+                m = self._metric_history[node.id]
+                m["cpu"].append(node.current_metrics.cpu_utilization)
+                # Store normalized latency for potential future multi-variate correlation
+                norm_lat = min(1.0, math.log1p(node.current_metrics.latency_ms) / math.log1p(1000))
+                m["latency"].append(norm_lat)
+                
+                if len(m["cpu"]) > 10:
+                    m["cpu"].pop(0)
+                    m["latency"].pop(0)
 
     # ======================================================================
     # INTERNAL: PREDICTION
