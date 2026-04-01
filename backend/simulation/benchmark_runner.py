@@ -83,11 +83,25 @@ class BenchmarkRunner:
                 if adaptive_res:
                     results_with_learning.append(adaptive_res["mitigated"])
 
+        no_mit_metrics = self._aggregate(results_no_mitigation)
+        static_mit_metrics = self._aggregate(results_with_mitigation)
+        adaptive_metrics = self._aggregate(results_with_learning, compute_trend=True, cycles=self.learning_cycles)
+
+        if no_mit_metrics.get("average_cascade_size", 0) > 0:
+            adaptive_reduction = ((no_mit_metrics["average_cascade_size"] - adaptive_metrics["average_cascade_size"]) / no_mit_metrics["average_cascade_size"]) * 100.0
+            adaptive_metrics["average_cascade_reduction_percent"] = round(max(0.0, adaptive_reduction), 2)
+            
+            static_reduction = ((no_mit_metrics["average_cascade_size"] - static_mit_metrics["average_cascade_size"]) / no_mit_metrics["average_cascade_size"]) * 100.0
+            static_mit_metrics["average_cascade_reduction_percent"] = round(max(0.0, static_reduction), 2)
+        else:
+            adaptive_metrics["average_cascade_reduction_percent"] = 0.0
+            static_mit_metrics["average_cascade_reduction_percent"] = 0.0
+
         return {
             "total_scenarios_per_track": self.repeated_trials * self.learning_cycles,
-            "no_mitigation_metrics": self._aggregate(results_no_mitigation),
-            "static_mitigation_metrics": self._aggregate(results_with_mitigation),
-            "adaptive_learning_metrics": self._aggregate(results_with_learning, compute_trend=True, cycles=self.learning_cycles)
+            "no_mitigation_metrics": no_mit_metrics,
+            "static_mitigation_metrics": static_mit_metrics,
+            "adaptive_learning_metrics": adaptive_metrics
         }
 
     def _run_single_scenario(self, seed: int, target_node: str, predictor: GraphFailurePredictor, train_model: bool) -> Dict[str, Any]:
